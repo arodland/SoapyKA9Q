@@ -9,6 +9,7 @@
 
 extern "C" {
 char const *App_path = "foo";
+#include "rtp.h"
 #include "multicast.h"
 #include "status.h"
 }
@@ -164,7 +165,7 @@ public:
         char iface[1024];
         resolve_mcast(m_status.c_str(), &Control_address, DEFAULT_STAT_PORT, iface, sizeof(iface), 0);
 
-        m_Status_sock = listen_mcast(&Control_address, iface);
+        m_Status_sock = listen_mcast(NULL, &Control_address, iface);
         if (m_Status_sock == -1) {
             // TODO
         }
@@ -189,7 +190,7 @@ public:
         int cmd_len = bp - cmd_buffer;
         sendCommand(cmd_buffer, cmd_len);
 
-        m_Input_fd = setup_mcast_in(m_data.c_str(), NULL, 0, 0);
+        m_Input_fd = setup_mcast_in(NULL, NULL, m_data.c_str(), NULL, 0, 0);
         if (m_Input_fd == -1) {
             // TODO
         }

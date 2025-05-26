@@ -27,7 +27,7 @@ enum status_type {
   STATUS_DEST_SOCKET,
   SETOPTS,
   CLEAROPTS,
-  UNUSED3,
+  RTP_TIMESTAMP, // current real-time-protocol timestamp
   UNUSED4,
   INPUT_SAMPRATE, // Nominal sample rate (integer)
   UNUSED6,
@@ -43,9 +43,9 @@ enum status_type {
   OUTPUT_SAMPRATE,
   OUTPUT_METADATA_PACKETS,
   OUTPUT_DATA_PACKETS,
+  OUTPUT_ERRORS,
 
   // Hardware
-  UNUSED22,
   CALIBRATE,
   // Hardware-specific analog gains
   LNA_GAIN,
@@ -72,7 +72,7 @@ enum status_type {
   KAISER_BETA,
   FILTER_BLOCKSIZE,
   FILTER_FIR_LENGTH,
-  UNUSED17,
+  FILTER2,
 
   // Signals
   IF_POWER,
@@ -110,10 +110,10 @@ enum status_type {
   OUTPUT_SAMPLES,
 
   OPUS_BIT_RATE,
-  UNUSED12,
-  UNUSED13,
-  UNUSED14,
-  UNUSED15,
+  MINPACKET,      // Minimum number of full blocks in an output packet, unless already full (0-3)
+  FILTER2_BLOCKSIZE,
+  FILTER2_FIR_LENGTH,
+  FILTER2_KAISER_BETA,
   UNUSED16,
 
   FILTER_DROPS,
@@ -150,7 +150,7 @@ enum status_type {
   BLOCKS_SINCE_POLL,  // Blocks since last poll
   AD_OVER,          // A/D full scale samples, proxy for overranges
   RTP_PT,           // Real Time Protocol Payload Type
-  STATUS_INTERVAL,      // Automatically send channel status over *data* channel every STATUS_RATE frames
+  STATUS_INTERVAL,      // Automatically send channel status over *data* channel every STATUS_INTERVAL frames
   OUTPUT_ENCODING,    // Output data encoding (see enum encoding in multicast.h)
   SAMPLES_SINCE_OVER, // Samples since last A/D overrange
   PLL_WRAPS,          // Count of complete linear mode PLL rotations

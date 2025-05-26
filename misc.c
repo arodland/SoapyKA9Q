@@ -23,6 +23,8 @@
 #include <sys/mman.h>
 #include <sched.h>
 #include <errno.h>
+#include <locale.h>
+#include <fcntl.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -75,38 +77,154 @@ int pipefill(int const fd,void *buffer,int const cnt){
 }
 
 // Set realtime priority (if possible)
-void realtime(void){
-#ifdef __linux__
-  {
+static int Base_prio;
+static bool Message_shown;
 
-    struct sched_param param;
-    param.sched_priority = (sched_get_priority_max(SCHED_FIFO) + sched_get_priority_min(SCHED_FIFO)) / 2; // midway?
-    if(sched_setscheduler(0,SCHED_FIFO|SCHED_RESET_ON_FORK,&param) != 0){
-      char name[25];
-      int err;
-      if((err = pthread_getname_np(pthread_self(),name,sizeof(name))) != 0 && errno != EACCES){
-	// Don't bother with permission failures
-	fprintf(stdout,"%s: sched_setscheduler failed, %s (%d)\n",name,strerror(err),err);
-      }
-    } else
-      return;
+int default_prio(void){
+#ifdef __linux__
+  static int minprio = -1; // Save the extra system calls
+  static int maxprio = -1;
+  if(minprio == -1 || maxprio == -1){
+    minprio = sched_get_priority_min(SCHED_FIFO);
+    maxprio = sched_get_priority_max(SCHED_FIFO);
+  }
+  return (minprio + maxprio) / 2; // midway?
+#else
+  return 0;
+#endif
+}
+
+
+
+void realtime(int prio){
+  if(prio == 0)
+    return;
+
+#ifdef __linux__
+  struct sched_param param = {0};
+
+  param.sched_priority = prio;
+  if(sched_setscheduler(0,SCHED_FIFO|SCHED_RESET_ON_FORK,&param) == 0)
+    return; // Successfully set realtime
+  {
+    char name[25];
+    int err = errno;
+    if(!Message_shown && pthread_getname_np(pthread_self(),name,sizeof(name)) == 0){
+      Message_shown = true;
+      fprintf(stdout,"%s: sched_setscheduler failed, %s (%d)\n",name,strerror(err),err);
+    }
   }
 #endif
-  // As backup, up our nice priority
-  int prio = getpriority(PRIO_PROCESS,0);
+  (void)prio;
+  // As backup, decrease our niceness by 10
+  Base_prio = getpriority(PRIO_PROCESS,0);
   errno = 0; // setpriority can return -1
-  prio = setpriority(PRIO_PROCESS,0,prio - 10);
-  if(prio != 0 && errno != EACCES){ // Not EPERM!
+  int niceness = setpriority(PRIO_PROCESS,0,Base_prio - 10);
+  if(niceness != 0){
     int err = errno;
     char name[25];
     memset(name,0,sizeof(name));
-    if(pthread_getname_np(pthread_self(),name,sizeof(name)-1) == 0){
-      // permission failures happen frequently, don't bother
+    if(!Message_shown && pthread_getname_np(pthread_self(),name,sizeof(name)-1) == 0){
+      Message_shown = true;
       fprintf(stdout,"%s: setpriority failed, %s (%d)\n",name,strerror(err),err);
     }
   }
 }
 
+// Drop back to normal priority, to avoid blocking a core when doing something time-consuming, like a FFT plan
+// Return true if we had previously been running at realtime, false otherwise
+
+int norealtime(void){
+#ifdef __linux__
+  if(sched_getscheduler(0) == SCHED_OTHER)
+    return 0; // Already normal
+
+  struct sched_param param = {0};
+  sched_getparam(0,&param);
+  int old_priority = param.sched_priority;
+
+  param.sched_priority = 0;
+  if(sched_setscheduler(0,SCHED_OTHER,&param) == 0)
+    return old_priority; // Successfully returned to normal
+
+  {
+    int err = errno; // in case getname changes it
+    char name[25] = {0};
+    if(!Message_shown && pthread_getname_np(pthread_self(),name,sizeof(name)) == 0){
+      Message_shown = true;
+      fprintf(stdout,"%s: sched_setscheduler failed, %s (%d)\n",name,strerror(err),err);
+    }
+  }
+#endif
+  // Try renicing to our base prio
+  errno = 0; // setpriority can return -1
+  int prio = getpriority(PRIO_PROCESS,0);
+  if(prio == Base_prio)
+    return prio; // Already normal niceness
+
+  prio = setpriority(PRIO_PROCESS,0,Base_prio);
+  if(prio == 0)
+    return prio; // Successfully returned to normal niceness
+  // Can it really fail when we're lowering?
+  if(!Message_shown){
+    int err = errno;
+    char name[25] = {0};
+    if(pthread_getname_np(pthread_self(),name,sizeof(name)-1) == 0){
+      Message_shown = true;
+      fprintf(stdout,"%s: setpriority failed to lower, %s (%d)\n",name,strerror(err),err);
+    }
+  }
+  return prio;  // Don't really know our state
+}
+
+// Stay on this CPU core
+bool Affinity = false;
+void stick_core(void){
+  if(!Affinity)
+    return;
+
+#if __linux__ // Not supported on macos, etc
+  char name[25] = {0};
+  pthread_t self = pthread_self();
+  if(pthread_getname_np(self,name,sizeof(name)-1) != 0)
+    fprintf(stdout,"getname(%ud) failed: %s\n",(unsigned int)self,strerror(errno));
+
+  int cpu = sched_getcpu();
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  CPU_SET(cpu,&cpuset);
+  fprintf(stdout,"%s sched_setaffinity(pid=%u,cores=",name,(unsigned int)self);
+  // Any hyperthreading siblings?
+  char sysname[PATH_MAX] = {0};
+  snprintf(sysname,sizeof sysname,"/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list",cpu);
+  FILE *fp = fopen(sysname,"r");
+  if(fp != NULL){
+    char corelist[128] = {0};
+    if(fgets(corelist,sizeof corelist,fp) != NULL){
+      char *string = corelist;
+      while(1){
+	char *ptr = NULL;
+	if((ptr = strsep(&string,",")) == NULL)
+	  break;
+	cpu = strtol(ptr,NULL,0);
+	CPU_SET(cpu,&cpuset);
+	fprintf(stdout," %d",cpu);
+      }
+    }
+    fclose(fp);
+    fp = NULL;
+  } else {
+    fprintf(stdout," %d",cpu);
+  }
+  fprintf(stdout,")\n");
+
+  if (sched_setaffinity(0, sizeof(cpuset), &cpuset) == -1) {
+    fprintf(stdout," failed: %s\n",strerror(errno));
+  } else {
+    fprintf(stdout,"\n");
+  }
+#endif
+}
 // Remove return or newline, if any, from end of string
 void chomp(char *s){
 
@@ -117,6 +235,18 @@ void chomp(char *s){
     *cp = '\0';
   if((cp = strchr(s,'\n')) != NULL)
     *cp = '\0';
+}
+// Return a duplicate of the string 'str', ensuring that it's terminated by 'suffix'
+char *ensure_suffix(char const *str, char const *suffix){
+  char const *cp = strstr(str,suffix);
+  if(cp != NULL && strlen(cp) == strlen(suffix))
+    return strdup(str);
+
+  char *result = NULL;
+  int len = asprintf(&result,"%s%s",str,suffix);
+  if(len < 0)
+    return NULL;
+  return result;
 }
 
 
@@ -130,7 +260,7 @@ void normalize_time(struct timespec *x){
     x->tv_sec++;
   } else
     return;
-  
+
   // Unlikely to get here
   if(x->tv_nsec < 0 || x->tv_nsec >= BILLION){
     lldiv_t f = lldiv(x->tv_nsec,BILLION);
@@ -219,7 +349,7 @@ char *ftime(char * result,int size,int64_t t){
     t = -t; // absolute value
   } else
     *cp = ' ';
-  
+
   cp++;
   size--;
 
@@ -232,7 +362,7 @@ char *ftime(char * result,int size,int64_t t){
     r = snprintf(cp,size,"%3lld:",(long long)hr);
   else
     r = snprintf(cp,size,"    ");
-    
+
   if(r < 0)
     return NULL;
   cp += r;
@@ -251,14 +381,14 @@ char *ftime(char * result,int size,int64_t t){
     // Hours zero, show minute without leading 0
     r = snprintf(cp,size,"%2d:",mn);
   else
-    r = snprintf(cp,size,"   ");    
-  
+    r = snprintf(cp,size,"   ");
+
   assert(r == 3);
   if(r < 0)
     return NULL;
   cp += r;
   size -= r;
-      
+
 
   if(hr > 0 || mn > 0)
   // Hours or minutes are nonzero, show seconds with leading 0
@@ -292,28 +422,40 @@ double parse_frequency(char const *s,bool heuristics){
 
     ss[i] = '\0';
   }
+  // Don't hardwire the decimal point, use the current locale
+  char decimal = '.';
+  struct lconv *lc = localeconv();
+  if(lc != NULL && lc->decimal_point != NULL && strlen(lc->decimal_point) > 0)
+    decimal = lc->decimal_point[0];
+
   double mult = 1;
   // k, m or g in place of decimal point indicates scaling by 1k, 1M or 1G
+  // h (hertz) means unity scaling; it can be used as a locale-independent
+  // decimal point
   char *sp = NULL;
   if((sp = strchr(ss,'g')) != NULL){
     mult = 1e9;
-    *sp = '.';
+    *sp = decimal;
   } else if((sp = strchr(ss,'m')) != NULL){
     mult = 1e6;
-    *sp = '.';
+    *sp = decimal;
   } else if((sp = strchr(ss,'k')) != NULL){
     mult = 1e3;
-    *sp = '.';
-  } else if((sp = strchr(ss,'.')) != NULL){ // note explicit radix point
+    *sp = decimal;
+  } else if((sp = strchr(ss,'h')) != NULL){
+    mult = 1;
+    *sp = decimal;
+  } else if((sp = strchr(ss,decimal)) != NULL){
+    // Disable heuristic if explicitly given
   }
   char *endptr = NULL;
   double f = strtod(ss,&endptr);
   if(endptr == ss || f == 0)
     return 0; // Empty entry, or nothing decipherable
-    
+
   if(!heuristics || sp != NULL || f >= 1e5) // If multiplier explicitly given, or frequency >= 100 kHz (lower limit), return as-is
     return f * mult;
-    
+
   // no radix specified & heuristics enabled: empirically guess kHz or MHz
   if(f < 500)         // Could be kHz or MHz, arbitrarily assume MHz
     return f * 1e6;
@@ -344,6 +486,19 @@ uint32_t nextfastfft(uint32_t n){
   }
   return result;
 }
+
+// round up to next power of 2
+uint32_t round2(uint32_t v){
+  v--;
+  v |= v >> 1;
+  v |= v >> 2;
+  v |= v >> 4;
+  v |= v >> 8;
+  v |= v >> 16;
+  v++;
+  return v;
+}
+
 
 // The amplitude of a noisy FM signal has a Rice distribution
 // Given the ratio 'r' of the mean and standard deviation measurements, find the
@@ -509,56 +664,165 @@ size_t round_to_page(size_t size){
     pages++;
   return pages * getpagesize();
 }
+// Round 'size' up to next whole number of system pages
+size_t round_to_hugepage(size_t size){
+  size_t hugepagesize = 2 * 1024 * 1024; // 2 MB
+  imaxdiv_t const r = imaxdiv(size,(intmax_t)hugepagesize);
+  size_t pages = r.quot;
+  if(r.rem != 0)
+    pages++;
+  return pages * hugepagesize;
+}
+// Custom version of malloc that aligns to a cache line
+// This is 64 bytes on most modern machines, including the x86 and the ARM 2711 (Pi 4)
+// This is stricter than a float complex or double complex, which is required by fftwf/fftw
+void *lmalloc(size_t size){
+  void *ptr;
+  int r;
+  if((r = posix_memalign(&ptr,64,size)) == 0){
+    assert(ptr != NULL);
+    return ptr;
+  }
+  errno = r;
+  assert(false);
+  return NULL;
+}
 
 
 // Special version of malloc that allocates a mirrored block
 // The block first appears normally, then is followed by a duplicate mapping
 // Very useful for circular buffers that must be accessed sequentially, without wraparound
 // e.g., fftwf_execute()
-void *mirror_alloc(size_t size){
-  size = round_to_page(size); // mmap requires even number of pages
+// Linux and non-Linux are sufficiently different to warrant two separate routines
+#if __linux__
 
-  // Reserve virtual space for buffer + mirror
-  uint8_t * const base = mmap(NULL,size * 2, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-  if(base == MAP_FAILED){
-    return NULL; // failed
-  }
-  int fd;
-
-#if __linux__  
-  int flags = 0;
-  // New flag? Not documented on man page but mentioned in kernel warning message, so pass it if defined
-#ifdef MFD_NOEXEC_SEAL
-  flags |= MFD_NOEXEC_SEAL; // not executable and sealed to prevent changing to executable.
-#endif
-  fd = memfd_create("mirror_alloc",flags);
-  if(fd < 0){
-    perror("mirror_alloc memfd_create");
-    munmap(base,size * 2);
+#if 0
+// Try huge pages, return NULL if unavail
+static void *mirror_alloc_huge(size_t size){
+  size = round_to_hugepage(size);
+  // Create huge page file
+  char fname[256];
+  static int counter;
+  snprintf(fname,sizeof fname,"/dev/hugepages/%d-%d",getpid(),counter++);
+  int fd = open(fname,O_CREAT|O_RDWR,0600);
+  unlink(fname);
+  if(fd == -1){
+    perror("mirror_alloc_huge file create failed");
     return NULL;
   }
-#else
-  {
-    char path[] = "/tmp/cb-XXXXXX";
-    fd = mkstemp(path);
-    unlink(path);
-    if(fd < 0){
-      perror("mirror_alloc mkstemp");
-      munmap(base,size * 2);
-      return NULL;
-    }
+  // Reserve virtual space for buffer + mirror
+  uint8_t *base = mmap(NULL,size * 2, PROT_NONE, MAP_PRIVATE|MAP_HUGETLB|MAP_ANONYMOUS, -1, 0);
+  if(base == MAP_FAILED){
+    perror("mirror_alloc_huge first mmap");
+    close(fd);
+    return NULL; // failed
   }
-#endif
-
   if(ftruncate(fd,size) != 0){
     perror("mirror_alloc ftruncate");
     close(fd);
     munmap(base,size * 2);
     return NULL;
   }
-
   // Create first appearance of buffer
-  uint8_t * const nbase = mmap(base, size, PROT_READ|PROT_WRITE, MAP_FIXED|MAP_SHARED, fd, 0);
+  uint8_t *nbase = mmap(base, size, PROT_READ|PROT_WRITE, MAP_HUGETLB|MAP_FIXED|MAP_SHARED, fd, 0);
+  if(nbase != base){
+    perror("mirror_alloc_huge 2nd mmap");
+    close(fd);
+    munmap(base,size * 2);
+    return NULL;
+  }
+  // Create mirror immedately after first
+  uint8_t *mirror = mmap(base + size,size, PROT_READ|PROT_WRITE, MAP_HUGETLB|MAP_FIXED|MAP_SHARED, fd, 0);
+  if(mirror != base + size){
+    perror("mirror_alloc_huge 3rd mmap");
+    munmap(base,size * 2);
+    base = NULL;
+  }
+  close(fd); // No longer needed after all memory maps are in place
+  return base;
+}
+#endif
+
+// Allocate a mirrored buffer, with two consecutive mappings of the same memory
+// Very useful for ring buffers
+void *mirror_alloc(size_t size){
+#if 0 // Seems to hurt performance, disabled for now
+  if(size > 1024 * 1024){
+    // Try huge pages for big buffers
+    void *buffer = mirror_alloc_huge(size);
+    if(buffer != NULL)
+      return buffer;
+  }
+#endif
+  size = round_to_page(size);
+
+  int flags = 0;
+#ifdef MFD_NOEXEC_SEAL
+  // New flag? Not documented on man page but mentioned in kernel warning message, so pass it if defined
+  flags |= MFD_NOEXEC_SEAL; // not executable and sealed to prevent changing to executable.
+#endif
+  int fd = memfd_create("mirror_alloc",flags);
+  if(fd < 0){
+    perror("mirror_alloc tmpfile create");
+    return NULL;
+  }
+  if(ftruncate(fd,size) != 0){
+    perror("mirror_alloc ftruncate");
+    close(fd);
+    return NULL;
+  }
+  // Reserve virtual space for buffer + mirror
+  uint8_t *base = mmap(NULL,size * 2, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0); // Retry normal
+  if(base == MAP_FAILED){
+    perror("mirror_alloc first mmap");
+    close(fd);
+    return NULL; // failed
+  }
+  // Create first appearance of buffer
+  uint8_t *nbase = mmap(base, size, PROT_READ|PROT_WRITE, MAP_FIXED|MAP_SHARED, fd, 0);
+  if(nbase != base){
+    perror("mirror_alloc 2nd mmap");
+    close(fd);
+    munmap(base,size * 2);
+    return NULL;
+  }
+  // Create mirror immedately after first
+  uint8_t *mirror = mmap(base + size,size, PROT_READ|PROT_WRITE, MAP_FIXED|MAP_SHARED, fd, 0);
+  if(mirror != base + size){
+    perror("mirror_alloc 3rd mmap");
+    munmap(base,size * 2);
+    base = NULL;
+  }
+  close(fd); // No longer needed after all memory maps are in place
+  return base;
+}
+
+#else // macos, etc
+
+void *mirror_alloc(size_t size){
+  size = round_to_page(size); // mmap requires even number of pages
+
+  char path[] = "/tmp/cb-XXXXXX";
+  int fd = mkstemp(path);
+  unlink(path);
+  if(fd < 0){
+    perror("mirror_alloc mkstemp");
+    return NULL;
+  }
+  if(ftruncate(fd,size) != 0){
+    perror("mirror_alloc ftruncate");
+    close(fd);
+    return NULL;
+  }
+
+  // Reserve virtual space for buffer + mirror
+  uint8_t *base = mmap(NULL,size * 2, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0); // Retry normal
+  if(base == MAP_FAILED){
+    close(fd);
+    return NULL; // failed
+  }
+  // Create first appearance of buffer
+  uint8_t *nbase = mmap(base, size, PROT_READ|PROT_WRITE, MAP_FIXED|MAP_SHARED, fd, 0);
   if(nbase != base){
     perror("mirror_alloc first mmap");
     close(fd);
@@ -566,17 +830,68 @@ void *mirror_alloc(size_t size){
     return NULL;
   }
   // Create mirror immedately after first
-  uint8_t * const mirror = mmap(base + size,size, PROT_READ|PROT_WRITE, MAP_FIXED|MAP_SHARED, fd, 0);
-  close(fd); // No longer needed after all memory maps are in place
+  uint8_t *mirror = mmap(base + size,size, PROT_READ|PROT_WRITE, MAP_FIXED|MAP_SHARED, fd, 0);
   if(mirror != base + size){
     perror("mirror_alloc second mmap");
     munmap(base,size * 2);
-    return NULL;
+    base = NULL;
   }
+  close(fd); // No longer needed after all memory maps are in place
   return base;
 }
+#endif
+
+
+
 void mirror_free(void **p,size_t size){
+  if(p == NULL || *p == NULL)
+    return;
   munmap(*p, size * 2);
   *p = NULL; // Nail pointer
 }
 
+#undef DROP_ENABLE
+
+#if DROP_ENABLE
+static size_t linesize(){
+#ifdef _SC_LEVEL1_DCACHE_LINESIZE
+    long sz = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
+    if (sz > 0) return (size_t) sz;
+#endif
+    return 64;  // Default fallback
+}
+#endif
+
+
+#if DROP_ENABLE && __x86_64__
+void drop_cache(void *mem,size_t bytes){
+  uint8_t *p = (uint8_t *)mem;
+  static size_t line = 0;
+  if(line == 0)
+    line = linesize();
+  for(unsigned int i = 0; i < bytes; i += line){
+    asm volatile ("clflushopt (%0)" :: "r" (p) : "memory"); // need to check that we have clflushopt
+    p += line;
+  }
+  asm volatile ("sfence" ::: "memory");
+}
+#elif DROP_ENABLE &&  __aarch64__
+void drop_cache(void *mem,size_t bytes){
+  uint8_t *p = (uint8_t *)mem;
+  static size_t line = 0;
+  if(line == 0)
+    line = linesize();
+  for(unsigned int i = 0; i < bytes; i += line){
+    asm volatile ("dc civac, %0" :: "r" (p) : "memory");
+    p += line;
+  }
+  asm volatile ("dsb ish");  // Ensure completion
+}
+
+#else
+// Dummy
+void drop_cache(void *mem,size_t bytes){
+  (void)mem;
+  (void)bytes;
+}
+#endif

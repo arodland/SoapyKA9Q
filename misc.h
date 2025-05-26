@@ -18,6 +18,7 @@
 #include <math.h> // Get M_PI
 #include <stdlib.h> // for ldiv(), free()
 #include <stdbool.h>
+#include <sys/errno.h>
 #ifdef __linux__
 #include <bsd/string.h>
 #endif
@@ -25,9 +26,20 @@
 
 // Must be a macro so __FILE__ and __TIMESTAMP__ will substitute correctly
 #define VERSION() { fprintf(stdout,"KA9Q Multichannel SDR %s last modified %s\n",__FILE__,__TIMESTAMP__); \
-		    fprintf(stdout,"Copyright 2023, Phil Karn, KA9Q. May be used under the terms of the GNU Public License\n");}
+		    fprintf(stdout,"Copyright 2025, Phil Karn, KA9Q. May be used under the terms of the GNU Public License\n");}
 
 
+#define ASSERT_ZEROED(ptr, size) assert(memcmp(ptr, &(typeof(*(ptr))){0}, size) == 0)
+
+static inline void ASSERT_UNLOCKED(pthread_mutex_t *mutex){
+#ifndef NDEBUG
+  int rc = pthread_mutex_trylock(mutex);
+  assert(rc != EBUSY);
+  pthread_mutex_unlock(mutex);
+#else
+  (void)mutex;
+#endif
+}
 // 16-bit floating point is not consistent across platforms
 #ifdef __arm__  // ARM platform
   #if defined(__ARM_FP16_FORMAT_IEEE)
@@ -63,7 +75,12 @@ static float const SCALE12 = 1/2048.;
 static float const SCALE8 = 1./INT8_MAX;  // Scale signed 8-bit int to float in range -1, +1
 
 
-void realtime(void);
+int default_prio(void);
+void realtime(int prio);
+int norealtime(void);
+void stick_core(void);
+// Custom version of malloc that aligns to a cache line
+void *lmalloc(size_t size);
 
 // I *hate* this sort of pointless, stupid, gratuitous incompatibility that
 // makes a lot of code impossible to read and debug
@@ -141,9 +158,23 @@ static inline int init_recursive_mutex(pthread_mutex_t *m){
 #define cis(x) csincos(x)
 #define cispi(x) csincospi(x)
 
+// Sin(πf)
+static inline float sinpif(float x){
+  return sinf(x * M_PI);
+}
+
+// Normalized sinc function sin(πx) / πx
+static inline float sinc(float x){
+  if(x == 0)
+    return 1;
+  return sinpif(x) / (M_PI * x);
+}
+
+
 extern const char *App_path;
 extern int Verbose;
 extern char const *Months[12];
+extern bool Affinity;
 
 int dist_path(char *path,int path_len,const char *fname);
 char *format_gpstime(char *result,int len,int64_t t);
@@ -156,6 +187,7 @@ double parse_frequency(char const *,bool);
 uint32_t nextfastfft(uint32_t n);
 int pipefill(int,void *,int);
 void chomp(char *);
+char *ensure_suffix(char const *str, char const *suffix);
 uint32_t ElfHash(uint8_t const *s,int length);
 uint32_t ElfHashString(char const *s);
 uint32_t fnv1hash(const uint8_t *s,int length);
@@ -171,39 +203,39 @@ float fm_snr(float r);
 inline static int16_t scaleclip(float const x){
   return (x >= 1.0) ? INT16_MAX : (x <= -1.0) ? -INT16_MAX : (int16_t)(INT16_MAX * x);
 }
-static inline complex float csincosf(float const x){
+static inline float complex csincosf(float const x){
   float s,c;
 
   sincosf(x,&s,&c);
   return CMPLXF(c,s);
 }
-static inline complex float csincospif(float const x){
+static inline float complex csincospif(float const x){
   float s,c;
   sincospif(x,&s,&c);
   return CMPLXF(c,s);
 }
 // return unit magnitude complex number with given phase x
-static inline complex double csincos(double const x){
+static inline double complex csincos(double const x){
   double s,c;
 
   sincos(x,&s,&c);
   return CMPLX(c,s);
 }
-static inline complex double csincospi(double const x){
+static inline double complex csincospi(double const x){
   double s,c;
   sincospi(x,&s,&c);
   return CMPLX(c,s);
 }
 // Complex norm (sum of squares of real and imaginary parts)
-static inline float cnrmf(complex float const x){
+static inline float cnrmf(float complex const x){
   return crealf(x)*crealf(x) + cimagf(x) * cimagf(x);
 }
-static inline double cnrm(complex double const x){
+static inline double cnrm(double complex const x){
   return creal(x)*creal(x) + cimag(x) * cimag(x);
 }
 // Fast approximate square root, for signal magnitudes
 // https://dspguru.com/dsp/tricks/magnitude-estimator/
-static inline float approx_magf(complex float x){
+static inline float approx_magf(float complex x){
   static float const Alpha = 0.947543636291;
   static float const Beta =  0.392485425092;
 
@@ -300,5 +332,10 @@ static inline void mirror_wrap(void const **p, void const * const base,size_t co
 
 // round argument up to an even number of system pages
 size_t round_to_page(size_t size);
+
+uint32_t round2(uint32_t v);
+
+void drop_cache(void *mem,size_t bytes);
+
 
 #endif // _MISC_H
